@@ -6,7 +6,7 @@ Bollinger Band crossing alerts (5m) -> Discord webhook
 - Duplicate suppression via SQLite
 - Env:
   - DISCORD_WEBHOOK (required)
-  - TICKERS (comma-separated, e.g. "AAPL,MSFT,ES=F,CL=F")
+  - TICKERS (optional; comma-separated). If not set, uses the default list below.
   - BB_LENGTH (default 107)
   - BB_MULT (default 1.7)
   - DRY_RUN (optional: "1" to print only)
@@ -23,13 +23,21 @@ import requests
 import pandas as pd
 import yfinance as yf
 
+DEFAULT_TICKERS = [
+    "AAPL", "MSFT", "TSLA", "SPY", "QQQ", "NVDA",
+    "MES=F", "MNQ=F", "MGC=F", "MCL=F", "MHG=F", "SIL=F",
+    "EURUSD=X", "GBPUSD=X", "JPY=X", "USDJPY=X", "USDCAD=X", "AUDUSD=X"
+]
+
 # --- config from env
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "").strip()
 if not WEBHOOK:
     print("ERROR: DISCORD_WEBHOOK not set", file=sys.stderr)
     sys.exit(2)
 
-TICKERS = [t.strip() for t in os.environ.get("TICKERS", "AAPL,MSFT").split(",") if t.strip()]
+env_tickers = os.environ.get("TICKERS", "").strip()
+TICKERS = [t.strip() for t in env_tickers.split(",") if t.strip()] if env_tickers else DEFAULT_TICKERS
+
 BB_LENGTH = int(os.environ.get("BB_LENGTH", "107"))
 BB_MULT = float(os.environ.get("BB_MULT", "1.7"))
 DRY_RUN = os.environ.get("DRY_RUN", "").strip() == "1"
@@ -66,8 +74,7 @@ def mark_sent(conn, symbol: str, bar_ts: str, signal: str):
 # --- TA: Bollinger bands + crossing
 def compute_bb(close: pd.Series, length: int, mult: float) -> Tuple[pd.Series, pd.Series, pd.Series]:
     basis = close.rolling(length, min_periods=length).mean()
-    # ddof=0 approximates Pine's ta.stdev behavior for long windows
-    stdev = close.rolling(length, min_periods=length).std(ddof=0)
+    stdev = close.rolling(length, min_periods=length).std(ddof=0)  # Pine-like
     upper = basis + mult * stdev
     lower = basis - mult * stdev
     return basis, upper, lower
@@ -89,7 +96,7 @@ def send_discord(content: str):
     if DRY_RUN:
         print("[DRY_RUN] Would POST:", json.dumps(payload))
         return True
-    r = requests.post(WEBHOOK, json=payload, timeout=15)
+    r = requests.post(WEBHOOK, json=payload, timeout=20)
     if r.status_code in (200, 204):
         return True
     print(f"Discord webhook error {r.status_code}: {r.text}", file=sys.stderr)
@@ -101,7 +108,7 @@ def fmt_ts(ts: pd.Timestamp) -> str:
     return ts.tz_convert("UTC").strftime("%Y-%m-%d %H:%M:%S %Z")
 
 def process_symbol(conn, symbol: str):
-    # 5m data; 7d gives enough bars for long window while staying light
+    # 5m data; 7d window gives enough for 107-length calc
     df = yf.download(symbol, period="7d", interval="5m", auto_adjust=False, progress=False)
     if df is None or df.empty or "Close" not in df.columns:
         print(f"WARN: no data for {symbol}")
@@ -117,7 +124,7 @@ def process_symbol(conn, symbol: str):
     basis, upper, lower = compute_bb(close, BB_LENGTH, BB_MULT)
     df = df.assign(Basis=basis, Upper=upper, Lower=lower)
 
-    # need last two COMPLETED bars with bands computed
+    # need last two completed bars with bands computed
     valid = df.dropna(subset=["Basis", "Upper", "Lower"])
     if len(valid) < 2:
         print(f"INFO: not enough bars after BB calc for {symbol}")
@@ -130,7 +137,6 @@ def process_symbol(conn, symbol: str):
     if not signal:
         return
 
-    # duplicate suppression
     sig_key = signal
     cur_ts_str = cur_ts.isoformat()
     if already_sent(conn, symbol, cur_ts_str, sig_key):
@@ -139,8 +145,8 @@ def process_symbol(conn, symbol: str):
     arrow = "✅↑" if signal == "CROSS_ABOVE" else "❌↓"
     content = (
         f"{arrow} **{symbol}** 5m **{signal.replace('_', ' ')}**\n"
-        f"Close: {cur.Close:.4f}\n"
-        f"Upper: {cur.Upper:.4f} | Lower: {cur.Lower:.4f}\n"
+        f"Close: {cur.Close:.6f}\n"
+        f"Upper: {cur.Upper:.6f} | Lower: {cur.Lower:.6f}\n"
         f"Bar: {fmt_ts(cur_ts)}"
     )
 
@@ -152,8 +158,7 @@ def main():
     for sym in TICKERS:
         try:
             process_symbol(conn, sym)
-            # small spacing to be kind to API
-            time.sleep(0.2)
+            time.sleep(0.3)  # gentle spacing for API
         except Exception as e:
             print(f"ERROR processing {sym}: {e}", file=sys.stderr)
 
