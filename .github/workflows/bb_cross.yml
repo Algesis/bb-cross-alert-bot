@@ -1,0 +1,51 @@
+name: BBand 5m Alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: bband-5m-alerts
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Restore duplicate-suppression state between runs
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: bband-alerts-state
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TICKERS: ${{ vars.TICKERS || 'AAPL,MSFT,ES=F,CL=F' }}
+          BB_LENGTH: "107"
+          BB_MULT: "1.7"
+        run: python bb_cross_bot.py
+
+      # Save updated state (so we don't resend the same bar)
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: bband-alerts-state
